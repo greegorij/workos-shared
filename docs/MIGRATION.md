@@ -125,3 +125,68 @@ The change is purely additive (handlers + formatter), no behavioural side effect
 - [ ] Add `LOG_LEVEL` / `WEBHOOK_URL` to `.env` if needed
 - [ ] Smoke test: `systemctl restart` + `journalctl -u … -n 30`
 - [ ] Commit per module (small, reviewable scope)
+
+---
+
+# `workos_shared.openrouter` (v0.2.0 — WorkOS E2 S6, s87)
+
+**Use case:** gateway to multiple LLM providers (Claude, GPT, Gemini, open-source) via OpenRouter. Useful for model experimentation, multi-provider resilience, Cloud Routine fallback when Anthropic weekly quota exhausted.
+
+## Quickstart
+
+```python
+from workos_shared import OpenRouterClient
+
+# Resolution order: explicit → OPENROUTER_API_KEY env → ~/.claude/.openrouter.env file
+client = OpenRouterClient()
+
+response = client.chat(
+    model="google/gemini-2.5-flash",
+    messages=[{"role": "user", "content": "Hello"}],
+    temperature=0.7,
+)
+print(response["choices"][0]["message"]["content"])
+
+# List available models (cached 1h)
+models = client.list_models()
+print([m["id"] for m in models[:5]])
+```
+
+## API key storage
+
+Three resolution paths (in order):
+
+1. **Explicit argument** — `OpenRouterClient(api_key="or-xxx")`
+2. **Environment variable** — `OPENROUTER_API_KEY` in shell
+3. **File** — `~/.claude/.openrouter.env` (either `OPENROUTER_API_KEY=or-xxx` line, or plain key only)
+
+## Design notes
+
+- **Zero external deps** — stdlib only (`urllib.request`), consistent with workos-shared policy.
+- **Cache:** `list_models()` caches in memory for 1h. Pass `force_refresh=True` to bypass.
+- **Timeout:** default 60s (configurable via `timeout=...`).
+- **Error handling:** HTTP errors raise `OpenRouterError` with `.status_code` and `.body`. Network errors propagate `urllib.error.URLError`.
+- **Logging:** all activity logged via `workos_shared.logger` (service name `workos-openrouter`).
+- **Analytics:** pass `app_name=` / `app_url=` to OpenRouterClient for OpenRouter dashboard attribution (adds `X-Title` / `HTTP-Referer` headers).
+
+## Testing
+
+```bash
+cd workos-shared
+python3 -m pytest tests/test_openrouter.py -v
+# 13 tests (key resolution, client init, headers, chat payload, list_models cache, error handling)
+```
+
+## Typical use cases (s87)
+
+1. **Dev experimentation** — test prompts against Gemini before committing to Claude cost.
+2. **Cloud Routine fallback** — when Anthropic Max x20 weekly quota exhausted, switch Supervisor to Gemini via OpenRouter.
+3. **Multi-model evaluation** — run same eval against 3 models, compare quality/cost.
+4. **VPS Gemini army (E2 S6 future)** — VPS subagents use OpenRouter to route to Gemini API (batch discount 50%).
+
+## Not yet implemented (E2 S6 backlog)
+
+- Streaming responses (`stream=True`) — currently returns full response only.
+- Tool use / function calling support (OpenRouter schema = OpenAI-compatible tools).
+- Retry with exponential backoff (consumer should wrap if needed).
+- Per-model cost tracking integration with E4 tracker.

@@ -8,7 +8,7 @@ Single source of truth for cross-repo helpers reused by `jarvis-rag`, `fireflies
 
 ## Design rules
 
-1. **Zero external dependencies.** `workos_shared` uses stdlib only. Any heavy dep (httpx, chromadb, voyage) goes in the *consumer* repo, not here.
+1. **Zero external dependencies in the core.** Core modules (logger, webhook, openrouter) use stdlib only. Modules that bind to a vendor SDK (like `anthropic_client`) expose the SDK via an *optional extra* (`pip install workos-shared[anthropic]`) and import it lazily.
 2. **Additive, not enforcing.** Each module is opt-in. Consumers keep their local configuration (handlers, filters) via parameters.
 3. **One module = one concern.** Logger is logger. HTTP client is HTTP client. No grab-bag helpers.
 4. **Python 3.11+.** Matches the lowest version across adopter repos.
@@ -18,10 +18,12 @@ Single source of truth for cross-repo helpers reused by `jarvis-rag`, `fireflies
 | Module | Status | Purpose |
 |---|---|---|
 | `workos_shared.logger` | ✅ v0.1 | Structured JSON logging with rotating file + console + optional webhook. |
-| `workos_shared.http_client` | backlog (E3 S4) | httpx wrapper with retry + rate-limit. |
-| `workos_shared.chromadb_store` | backlog (E3 S4) | ChromaDB collection wrapper (Protocol-based). |
-| `workos_shared.voyage_embedder` | backlog (E3 S4) | Voyage AI embedding client. |
-| `workos_shared.auth` | backlog (E3 S4) | OAuth 2.1 helpers (PKCE + client credentials). |
+| `workos_shared.openrouter` | ✅ v0.2 (E2 S6) | Stdlib-only OpenRouter client for multi-provider LLM calls. |
+| `workos_shared.anthropic_client` | ✅ v0.3 (E16 S2) | Anthropic API wrapper: Batch API + long-prompt routing + sync fallback. Requires `[anthropic]` extra. |
+| `workos_shared.webhook` | ✅ v0.3 (E16 S2) | HMAC signature verification + persistent dedup (framework-agnostic). |
+| `workos_shared.chromadb_store` | backlog | ChromaDB collection wrapper (Protocol-based). |
+| `workos_shared.voyage_embedder` | backlog | Voyage AI embedding client. |
+| `workos_shared.auth` | backlog | OAuth 2.1 helpers (PKCE + client credentials). |
 
 ## Install
 
@@ -62,6 +64,40 @@ Optional webhook for `ERROR+`:
 
 ```bash
 export WEBHOOK_URL="https://hooks.slack.com/..."
+```
+
+## Quick start — anthropic_client (E16 S2)
+
+```python
+from workos_shared import call_claude
+
+result = call_claude(
+    api_key=ANTHROPIC_API_KEY,
+    system="You are a helpful assistant.",
+    user_message="Summarise this transcript: ...",
+    custom_id="meeting-12345",
+    long_prompt_safe=True,       # auto-switch to Sonnet 4.5 + 1M context for >540K chars
+    batch_enabled=True,          # Batch API first (50% cheaper); falls back to sync on timeout
+)
+print(result.path, result.model, result.elapsed_s)  # e.g. "batch" "claude-sonnet-4-20250514" 124.3
+```
+
+Install the optional `anthropic` SDK: `pip install workos-shared[anthropic]` (or keep it in the consumer's own `pyproject.toml` — the wrapper imports it lazily).
+
+## Quick start — webhook (E16 S2)
+
+```python
+from workos_shared import verify_hmac_signature, PersistentDedup, SignatureMismatch
+
+try:
+    verify_hmac_signature(body=raw_bytes, signature=request.headers["x-hub-signature"], secret=SECRET)
+except SignatureMismatch:
+    return ("forbidden", 403)
+
+dedup = PersistentDedup("/var/lib/myservice/processed.ids")
+if not dedup.add(meeting_id):
+    return ("already processed", 200)
+# ... process ...
 ```
 
 ## Migrating an existing service

@@ -4,19 +4,26 @@ build-backend = "hatchling.build"
 
 [project]
 name = "workos-shared"
-version = "0.1.0"
-description = "Shared modules for Jarvis ecosystem (WorkOS E3)"
+version = "0.3.0"
+description = "Shared modules for Jarvis ecosystem (WorkOS E3 + E16)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
 authors = [{ name = "Grzegorz Golaś" }]
-# Hard constraint (E3): zero external dependencies — stdlib only.
+# Core library stays stdlib-only (logger, webhook, openrouter helpers).
+# Modules that bind to a vendor SDK — like `anthropic_client` — import it
+# lazily and expose the SDK via the `[anthropic]` extra. Consumer repos
+# typically already pin `anthropic`, so this is additive, not mandatory.
 dependencies = []
 
 [project.optional-dependencies]
+anthropic = [
+    "anthropic>=0.39",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
+    "anthropic>=0.39",
 ]
 
 [tool.hatch.build.targets.wheel]

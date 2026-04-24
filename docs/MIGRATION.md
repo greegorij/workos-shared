@@ -190,3 +190,228 @@ python3 -m pytest tests/test_openrouter.py -v
 - Tool use / function calling support (OpenRouter schema = OpenAI-compatible tools).
 - Retry with exponential backoff (consumer should wrap if needed).
 - Per-model cost tracking integration with E4 tracker.
+
+---
+
+# `workos_shared.anthropic_client` (v0.3.0 — WorkOS E16 S2)
+
+**Use case:** consolidated Anthropic wrapper shared across `fireflies_agent`, `vault_keeper`, `budget_agent`. Solves the drift where Fireflies had long-prompt handling (PR #3/#4) but Vault Keeper did not → VK semantic crashed on 200K token ceiling (incident s92 2026-04-23).
+
+## Quickstart
+
+```python
+from workos_shared import call_claude
+
+result = call_claude(
+    api_key=ANTHROPIC_API_KEY,
+    system=SYSTEM_PROMPT,
+    user_message=user_text,
+    custom_id=f"myservice-{unique_id}",
+    long_prompt_safe=True,
+    batch_enabled=True,
+)
+
+if result.text.startswith("```"):
+    from workos_shared import parse_json_response
+    data = parse_json_response(result.text)  # tolerates markdown fences
+```
+
+Async variant (for `async def` call sites):
+
+```python
+from workos_shared import call_claude_async
+
+result = await call_claude_async(
+    api_key=ANTHROPIC_API_KEY,
+    system=SYSTEM_PROMPT,
+    user_message=user_text,
+    custom_id="myservice-1",
+)
+```
+
+## Migration — replace raw `anthropic.Anthropic(...)` calls
+
+### 1. Install the `anthropic` extra
+
+```bash
+# Consumer repo pyproject.toml:
+dependencies = [
+    "workos-shared[anthropic] @ file:///home/ccuser/workos-shared",
+    # ...
+]
+```
+
+Or rely on the consumer already pinning `anthropic` directly — the wrapper
+imports it lazily.
+
+### 2. Swap the 70-line Batch + sync fallback block
+
+**Before** (fragment from `vault_keeper/semantic.py` pre-E16):
+
+```python
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+try:
+    batch = client.messages.batches.create(requests=[...])
+    for attempt in range(60):
+        await asyncio.sleep(30)
+        status = client.messages.batches.retrieve(batch.id)
+        if status.processing_status == "ended":
+            # ... 20 more lines
+except Exception:
+    ...
+response = client.messages.create(...)  # sync fallback
+text = response.content[0].text.strip()
+return _parse_response(text)
+```
+
+**After:**
+
+```python
+from workos_shared import call_claude_async, parse_json_response
+
+result = await call_claude_async(
+    api_key=ANTHROPIC_API_KEY,
+    system=SYSTEM_PROMPT,
+    user_message=user_message,
+    custom_id="vault-keeper-semantic",
+    long_prompt_safe=True,   # unlocks 1M context streaming path when needed
+)
+return parse_json_response(result.text)
+```
+
+### 3. Decision tree the wrapper encodes
+
+```
+long_prompt_safe = True AND len(system)+len(user) > 540_000
+    └── YES → Sonnet 4.5 + 1M context beta + streaming sync
+    └── NO  → try Batch API (poll up to ~30 min)
+              └── success → CallResult(path="batch")
+              └── timeout/error → sync API fallback (path="sync")
+```
+
+`CallResult.path` tells you which branch ran — log it to journalctl for
+pipeline observability.
+
+## Configuration knobs
+
+| Argument | Default | When to tune |
+|---|---|---|
+| `long_prompt_safe` | `True` | Disable only if you're certain the prompt is bounded and want stricter latency. |
+| `long_prompt_threshold` | `540_000` | Measured for Polish text (3.04 chars/token + 20K headroom). Lower for other languages with better tokenisation (e.g. English: try `600_000`). |
+| `batch_enabled` | `True` | Disable for hot interactive paths where 30s poll floor is unacceptable. |
+| `batch_poll_interval_s` | `30` | Lower for test suites; don't drop below 15 in prod (Anthropic rate limits batch polling). |
+| `batch_max_polls` | `60` | 60 × 30s = 30 min. Bump if your workload expects long batches; lower if you want faster sync fallback. |
+| `default_model` | `claude-sonnet-4-20250514` | Bump to latest Sonnet when released. |
+| `long_context_model` | `claude-sonnet-4-5-20250929` | 1M context beta variant. |
+
+## Testing
+
+```bash
+cd workos-shared
+python3 -m pytest tests/test_anthropic_client.py -v
+# 8 tests: threshold, JSON parsing (plain + fenced + malformed), batch success,
+# timeout→sync fallback, long-prompt streaming, dual failure raises, async batch,
+# batch_enabled=False bypass.
+```
+
+## Known gaps / future work
+
+- **No rate-limit backoff on batch polling.** Anthropic hasn't surfaced 429 on
+  `batches.retrieve()` in practice, but if that changes add tenacity here
+  without touching consumers.
+- **No streaming support for non-long prompts** — Batch path returns full text.
+  Adding a `stream=True` arg for the sync path is trivial if a consumer needs
+  token-by-token output.
+- **Cost tracking integration with E4 tracker** — follow-up sprint.
+
+---
+
+# `workos_shared.webhook` (v0.3.0 — WorkOS E16 S2)
+
+**Use case:** HMAC signature verification + dedup helpers shared between
+`fireflies_agent` (full) and `jarvis_rag` (currently missing dedup — adoption
+closes the gap identified in the E16 S1 audit).
+
+## Quickstart
+
+```python
+from workos_shared import verify_hmac_signature, PersistentDedup, SignatureMismatch
+
+# Per-request: verify HMAC
+try:
+    verify_hmac_signature(
+        body=raw_body_bytes,
+        signature=request.headers.get("x-hub-signature", ""),
+        secret=FIREFLIES_WEBHOOK_SECRET,
+    )
+except SignatureMismatch as exc:
+    return PlainTextResponse(str(exc), status_code=403)
+
+# At startup: load dedup (loads existing IDs from disk)
+dedup = PersistentDedup("/home/ccuser/jarvis-rag/.processed_ids")
+
+# Per-request: dedup + process
+if not dedup.add(meeting_id):
+    return PlainTextResponse("already processed", status_code=200)
+asyncio.create_task(process(meeting_id))
+```
+
+## Migration — swap ad-hoc HMAC blocks
+
+**Before** (fragment from `jarvis_rag/server.py` pre-E16):
+
+```python
+signature = request.headers.get("X-Hub-Signature-256", "").removeprefix("sha256=")
+expected = hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
+if not hmac.compare_digest(signature, expected):
+    return PlainTextResponse("Invalid signature", status_code=403)
+```
+
+**After:**
+
+```python
+from workos_shared import verify_hmac_signature, SignatureMismatch
+
+try:
+    verify_hmac_signature(
+        body=body,
+        signature=request.headers.get("X-Hub-Signature-256", ""),
+        secret=SECRET,
+    )
+except SignatureMismatch:
+    return PlainTextResponse("Invalid signature", status_code=403)
+```
+
+The wrapper is case-insensitive on the algo prefix (`sha256=` / `SHA256=`) and
+tolerates bare hex digests, so drop-in replacement works for both the Fireflies
+scheme (`x-hub-signature: sha256=...`) and GitHub-style
+(`X-Hub-Signature-256: sha256=...`).
+
+## Why PersistentDedup beats an in-memory `set()`
+
+Fireflies sends multiple webhooks per meeting (transcription completed +
+summary completed). Without persistent dedup, a service restart between the
+two webhooks re-processes the meeting. The file-backed set survives restarts
+while staying in-memory O(1) at request time.
+
+Append-only on success: the `add()` call writes one line, then cache entry.
+`discard()` rewrites in-memory only (use after a processing failure to allow
+retry on next restart).
+
+## Testing
+
+```bash
+cd workos-shared
+python3 -m pytest tests/test_webhook.py -v
+# 13 tests: HMAC (scheme prefix, bare hex, case-insensitive, wrong digest,
+# empty inputs, algo_hint override); PersistentDedup (add/dedupe/persist,
+# restart survival, discard memory-only, purge destructive, empty key guard).
+```
+
+## Known gaps / future work
+
+- **No timestamp replay guard.** If Fireflies adds a `X-Hub-Timestamp` header,
+  a `max_age_seconds` param here would let us reject stale replays beyond HMAC.
+- **No streaming-body verification.** Caller must read full body before
+  calling — matches Fireflies/GitHub semantics, but wouldn't work for
+  chunked-transfer sources if we adopt any.
